@@ -4,9 +4,9 @@
 
 **Goal:** Build a personal knowledge management tool that saves web articles, YouTube videos, and podcasts — extracts content, summarizes with AI, and enables semantic search over saved items.
 
-**Architecture:** Next.js 14+ App Router on Vercel with Supabase (PostgreSQL + pgvector) for persistence, Upstash Redis for job state, and AssemblyAI for async podcast transcription. A LLM abstraction layer supports Claude or OpenAI, with OpenAI embeddings always used for consistency.
+**Architecture:** Next.js 14+ App Router on Vercel with Supabase (PostgreSQL + pgvector) for persistence and AssemblyAI for async podcast transcription. Processing uses Next.js `after()` to run reliably after the response is sent. A LLM abstraction layer supports Claude or OpenAI, with OpenAI embeddings always used for consistency.
 
-**Tech Stack:** Next.js 14+ (App Router), TypeScript, Tailwind CSS, Supabase, pgvector, Upstash Redis, OpenAI (embeddings), Anthropic Claude / OpenAI (LLM), AssemblyAI, @mozilla/readability, youtube-transcript
+**Tech Stack:** Next.js 14+ (App Router), TypeScript, Tailwind CSS, Supabase, pgvector, OpenAI (embeddings), Anthropic Claude / OpenAI (LLM), AssemblyAI, @mozilla/readability, youtube-transcript
 
 ---
 
@@ -57,7 +57,7 @@ npx create-next-app@latest . --typescript --tailwind --eslint --app --src-dir --
 **Step 2: Install core dependencies**
 
 ```bash
-npm install @supabase/supabase-js @supabase/ssr @upstash/redis
+npm install @supabase/supabase-js @supabase/ssr
 npm install @anthropic-ai/sdk openai
 npm install @mozilla/readability jsdom
 npm install youtube-transcript assemblyai
@@ -91,9 +91,9 @@ YOUTUBE_API_KEY=
 ASSEMBLYAI_API_KEY=
 ASSEMBLYAI_WEBHOOK_SECRET=
 
-# Upstash Redis
-UPSTASH_REDIS_REST_URL=
-UPSTASH_REDIS_REST_TOKEN=
+# App
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+API_SECRET_KEY=           # required in production for API auth
 EOF
 ```
 
@@ -168,6 +168,7 @@ CREATE TABLE items (
   embedding             vector(1536),
   error_message         text,
   transcription_job_id  text,         -- AssemblyAI job ID (podcasts only)
+  retry_count           integer DEFAULT 0,
 
   created_at            timestamptz DEFAULT now(),
   updated_at            timestamptz DEFAULT now()
@@ -178,6 +179,8 @@ CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 
 CREATE INDEX ON items USING gin (tags);
 CREATE INDEX ON items (status);
 CREATE INDEX ON items (created_at DESC);
+CREATE UNIQUE INDEX ON items (source_url);
+CREATE INDEX ON items (transcription_job_id) WHERE transcription_job_id IS NOT NULL;
 
 -- Updated_at trigger
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -361,6 +364,8 @@ git commit -m "feat: add shared TypeScript types"
 
 **Files:**
 - Create: `src/lib/llm/types.ts`
+- Create: `src/lib/llm/prompts.ts`
+- Create: `src/lib/llm/parse-summary.ts`
 - Create: `src/lib/llm/claude.ts`
 - Create: `src/lib/llm/openai.ts`
 - Create: `src/lib/llm/index.ts`
@@ -381,16 +386,12 @@ export interface EmbeddingProvider {
 }
 ```
 
-**Step 2: Create Claude provider**
+**Step 2: Create shared summarization prompt**
 
-Create `src/lib/llm/claude.ts`:
+Create `src/lib/llm/prompts.ts`:
 
 ```typescript
-import Anthropic from '@anthropic-ai/sdk'
-import type { LLMProvider } from './types'
-import type { Summary, SummarizeOptions } from '@/types/item'
-
-const SUMMARIZE_PROMPT = `You are a knowledge assistant. Summarize the following content.
+export const SUMMARIZE_PROMPT = `You are a knowledge assistant. Summarize the following content.
 
 Return a JSON object with exactly these fields:
 - "summary_short": 2-3 sentence summary
@@ -398,6 +399,49 @@ Return a JSON object with exactly these fields:
 - "tags": array of 3-5 topic tags (lowercase, no spaces, use hyphens)
 
 Respond with ONLY the JSON object, no markdown, no explanation.`
+```
+
+**Step 3: Create safe JSON response parser**
+
+Create `src/lib/llm/parse-summary.ts`:
+
+```typescript
+import type { Summary } from '@/types/item'
+
+export function parseSummaryResponse(raw: string): Summary {
+  // Strip markdown code fences if present
+  const cleaned = raw.replace(/^```(?:json)?\s*\n?/m, '').replace(/\n?```\s*$/m, '').trim()
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(cleaned)
+  } catch {
+    throw new Error(`LLM returned invalid JSON: ${raw.slice(0, 200)}`)
+  }
+
+  if (
+    typeof parsed !== 'object' || parsed === null ||
+    typeof (parsed as Record<string, unknown>).summary_short !== 'string' ||
+    !Array.isArray((parsed as Record<string, unknown>).summary_bullets) ||
+    !Array.isArray((parsed as Record<string, unknown>).tags)
+  ) {
+    throw new Error(`LLM response missing required fields: ${raw.slice(0, 200)}`)
+  }
+
+  return parsed as Summary
+}
+```
+
+**Step 4: Create Claude provider**
+
+Create `src/lib/llm/claude.ts`:
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk'
+import type { LLMProvider } from './types'
+import type { Summary, SummarizeOptions } from '@/types/item'
+import { SUMMARIZE_PROMPT } from './prompts'
+import { parseSummaryResponse } from './parse-summary'
 
 export class ClaudeProvider implements LLMProvider {
   private client: Anthropic
@@ -421,12 +465,12 @@ export class ClaudeProvider implements LLMProvider {
     const content = message.content[0]
     if (content.type !== 'text') throw new Error('Unexpected response type from Claude')
 
-    return JSON.parse(content.text) as Summary
+    return parseSummaryResponse(content.text)
   }
 }
 ```
 
-**Step 3: Create OpenAI provider**
+**Step 5: Create OpenAI provider**
 
 Create `src/lib/llm/openai.ts`:
 
@@ -434,15 +478,8 @@ Create `src/lib/llm/openai.ts`:
 import OpenAI from 'openai'
 import type { LLMProvider, EmbeddingProvider } from './types'
 import type { Summary, SummarizeOptions } from '@/types/item'
-
-const SUMMARIZE_PROMPT = `You are a knowledge assistant. Summarize the following content.
-
-Return a JSON object with exactly these fields:
-- "summary_short": 2-3 sentence summary
-- "summary_bullets": array of 5-8 key points as strings
-- "tags": array of 3-5 topic tags (lowercase, no spaces, use hyphens)
-
-Respond with ONLY the JSON object, no markdown, no explanation.`
+import { SUMMARIZE_PROMPT } from './prompts'
+import { parseSummaryResponse } from './parse-summary'
 
 export class OpenAILLMProvider implements LLMProvider {
   private client: OpenAI
@@ -463,7 +500,7 @@ export class OpenAILLMProvider implements LLMProvider {
 
     const content = response.choices[0].message.content
     if (!content) throw new Error('Empty response from OpenAI')
-    return JSON.parse(content) as Summary
+    return parseSummaryResponse(content)
   }
 }
 
@@ -484,7 +521,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 }
 ```
 
-**Step 4: Create provider factory**
+**Step 6: Create provider factory**
 
 Create `src/lib/llm/index.ts`:
 
@@ -514,14 +551,14 @@ export function getEmbeddingProvider(): EmbeddingProvider {
 export type { LLMProvider, EmbeddingProvider }
 ```
 
-**Step 5: Verify TypeScript compiles**
+**Step 7: Verify TypeScript compiles**
 
 ```bash
 npx tsc --noEmit
 ```
 Expected: No errors
 
-**Step 6: Commit**
+**Step 8: Commit**
 
 ```bash
 git add src/lib/llm/
@@ -907,6 +944,7 @@ git commit -m "feat: add podcast pipeline with AssemblyAI async transcription"
 
 **Files:**
 - Create: `src/lib/pipeline/detect.ts`
+- Create: `src/lib/pipeline/validate-url.ts`
 
 **Step 1: Create URL type detector**
 
@@ -943,34 +981,129 @@ export function detectSourceType(url: string): SourceType {
 }
 ```
 
-**Step 2: Commit**
+**Step 2: Create URL validation utility**
+
+Create `src/lib/pipeline/validate-url.ts`:
+
+```typescript
+const BLOCKED_HOSTS = /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0|\[::1\])/
+
+export function validateExternalUrl(url: string): URL {
+  const parsed = new URL(url)
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Only http and https URLs are supported')
+  }
+
+  if (BLOCKED_HOSTS.test(parsed.hostname)) {
+    throw new Error('URLs pointing to private networks are not allowed')
+  }
+
+  return parsed
+}
+```
+
+**Step 3: Commit**
 
 ```bash
-git add src/lib/pipeline/detect.ts
-git commit -m "feat: add URL source type detection utility"
+git add src/lib/pipeline/detect.ts src/lib/pipeline/validate-url.ts
+git commit -m "feat: add URL source type detection and validation utilities"
 ```
 
 ---
 
-## Task 10: API Route — POST /api/items
+## Task 10: API Route — POST /api/items (with safety guards)
 
 **Files:**
+- Create: `src/lib/logger.ts`
+- Create: `src/lib/env.ts`
+- Create: `src/lib/auth.ts`
 - Create: `src/app/api/items/route.ts`
 
-**Step 1: Create items POST route**
+**Step 1: Create structured logger**
+
+Create `src/lib/logger.ts`:
+
+```typescript
+type LogLevel = 'info' | 'warn' | 'error'
+
+function log(level: LogLevel, message: string, meta?: Record<string, unknown>) {
+  const entry = { level, message, timestamp: new Date().toISOString(), ...meta }
+  if (level === 'error') console.error(JSON.stringify(entry))
+  else console.log(JSON.stringify(entry))
+}
+
+export const logger = {
+  info: (msg: string, meta?: Record<string, unknown>) => log('info', msg, meta),
+  warn: (msg: string, meta?: Record<string, unknown>) => log('warn', msg, meta),
+  error: (msg: string, meta?: Record<string, unknown>) => log('error', msg, meta),
+}
+```
+
+**Step 2: Create environment variable validation**
+
+Create `src/lib/env.ts`:
+
+```typescript
+function requireEnv(name: string): string {
+  const value = process.env[name]
+  if (!value) throw new Error(`Missing required environment variable: ${name}`)
+  return value
+}
+
+export const env = {
+  supabaseUrl: requireEnv('NEXT_PUBLIC_SUPABASE_URL'),
+  supabaseAnonKey: requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'),
+  supabaseServiceKey: requireEnv('SUPABASE_SERVICE_ROLE_KEY'),
+  openaiApiKey: requireEnv('OPENAI_API_KEY'),
+  llmProvider: process.env.LLM_PROVIDER ?? 'claude',
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  youtubeApiKey: process.env.YOUTUBE_API_KEY,
+  assemblyaiApiKey: process.env.ASSEMBLYAI_API_KEY,
+  assemblyaiWebhookSecret: process.env.ASSEMBLYAI_WEBHOOK_SECRET,
+  appUrl: requireEnv('NEXT_PUBLIC_APP_URL'),
+  apiSecretKey: process.env.API_SECRET_KEY,
+} as const
+```
+
+**Step 3: Create auth guard**
+
+Create `src/lib/auth.ts`:
+
+```typescript
+import { NextRequest, NextResponse } from 'next/server'
+
+export function requireAuth(request: NextRequest): NextResponse | null {
+  if (process.env.NODE_ENV === 'development') return null
+
+  const apiKey = request.headers.get('x-api-key')
+  if (apiKey === process.env.API_SECRET_KEY) return null
+
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+}
+```
+
+**Step 4: Create items POST route**
 
 Create `src/app/api/items/route.ts`:
 
 ```typescript
 import { NextRequest, NextResponse } from 'next/server'
+import { after } from 'next/server'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { detectSourceType } from '@/lib/pipeline/detect'
+import { validateExternalUrl } from '@/lib/pipeline/validate-url'
 import { processArticle } from '@/lib/pipeline/article'
 import { processYouTube } from '@/lib/pipeline/youtube'
 import { submitPodcastForTranscription } from '@/lib/pipeline/podcast'
+import { requireAuth } from '@/lib/auth'
+import { logger } from '@/lib/logger'
 import type { ItemInsert } from '@/types/item'
 
 export async function POST(request: NextRequest) {
+  const authError = requireAuth(request)
+  if (authError) return authError
+
   const body = await request.json()
   const { url } = body
 
@@ -978,14 +1111,41 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'url is required' }, { status: 400 })
   }
 
+  // Validate URL: parse, check scheme, block private networks
   let parsedUrl: URL
   try {
-    parsedUrl = new URL(url)
-  } catch {
-    return NextResponse.json({ error: 'Invalid URL' }, { status: 400 })
+    parsedUrl = validateExternalUrl(url)
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Invalid URL' },
+      { status: 400 }
+    )
   }
 
   const supabase = createAdminClient()
+
+  // Rate limit: max 10 items per 5 minutes
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+  const { count } = await supabase
+    .from('items')
+    .select('id', { count: 'exact', head: true })
+    .gte('created_at', fiveMinutesAgo)
+
+  if (count !== null && count >= 10) {
+    return NextResponse.json({ error: 'Rate limit: max 10 items per 5 minutes' }, { status: 429 })
+  }
+
+  // Duplicate check: return existing item if URL already submitted
+  const { data: existing } = await supabase
+    .from('items')
+    .select('id, status')
+    .eq('source_url', parsedUrl.href)
+    .maybeSingle()
+
+  if (existing) {
+    return NextResponse.json({ id: existing.id, status: existing.status, duplicate: true })
+  }
+
   const sourceType = detectSourceType(parsedUrl.href)
 
   // Create item with pending status
@@ -1000,18 +1160,21 @@ export async function POST(request: NextRequest) {
     .single()
 
   if (insertError || !item) {
+    logger.error('Failed to create item', { url: parsedUrl.href, error: insertError?.message })
     return NextResponse.json({ error: 'Failed to create item' }, { status: 500 })
   }
 
-  // Process inline for articles and YouTube (~5-15s, acceptable for serverless)
-  // Podcasts are async via AssemblyAI webhook
-  if (sourceType === 'podcast') {
-    // Fire off async — don't await in request handler
-    processPodcastAsync(item.id, parsedUrl.href)
-  } else {
-    // Fire off async — return item ID immediately, client polls
-    processInlineAsync(item.id, parsedUrl.href, sourceType)
-  }
+  logger.info('Item created', { itemId: item.id, sourceType })
+
+  // Use after() to run processing reliably after the response is sent.
+  // This keeps the serverless function alive until processing completes.
+  after(async () => {
+    if (sourceType === 'podcast') {
+      await processPodcastAsync(item.id, parsedUrl.href)
+    } else {
+      await processInlineAsync(item.id, parsedUrl.href, sourceType)
+    }
+  })
 
   return NextResponse.json({ id: item.id, status: item.status }, { status: 201 })
 }
@@ -1020,6 +1183,7 @@ async function processInlineAsync(itemId: string, url: string, sourceType: 'arti
   const supabase = createAdminClient()
 
   await supabase.from('items').update({ status: 'processing' }).eq('id', itemId)
+  logger.info('Processing started', { itemId, sourceType })
 
   try {
     const data =
@@ -1031,8 +1195,11 @@ async function processInlineAsync(itemId: string, url: string, sourceType: 'arti
       .from('items')
       .update({ ...data, status: 'ready' })
       .eq('id', itemId)
+
+    logger.info('Processing completed', { itemId })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
+    logger.error('Processing failed', { itemId, error: message })
     await supabase
       .from('items')
       .update({ status: 'failed', error_message: message })
@@ -1044,6 +1211,7 @@ async function processPodcastAsync(itemId: string, url: string) {
   const supabase = createAdminClient()
 
   await supabase.from('items').update({ status: 'processing' }).eq('id', itemId)
+  logger.info('Podcast submission started', { itemId })
 
   try {
     const { transcription_job_id, title, author } = await submitPodcastForTranscription(url)
@@ -1054,8 +1222,11 @@ async function processPodcastAsync(itemId: string, url: string) {
       author,
       status: 'processing',
     }).eq('id', itemId)
+
+    logger.info('Podcast submitted to AssemblyAI', { itemId, transcription_job_id })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
+    logger.error('Podcast submission failed', { itemId, error: message })
     await supabase
       .from('items')
       .update({ status: 'failed', error_message: message })
@@ -1064,11 +1235,11 @@ async function processPodcastAsync(itemId: string, url: string) {
 }
 ```
 
-**Step 2: Commit**
+**Step 5: Commit**
 
 ```bash
-git add src/app/api/items/route.ts
-git commit -m "feat: add POST /api/items route with async processing"
+git add src/lib/logger.ts src/lib/env.ts src/lib/auth.ts src/app/api/items/route.ts
+git commit -m "feat: add POST /api/items with auth, rate limiting, SSRF protection, and structured logging"
 ```
 
 ---
@@ -1664,9 +1835,16 @@ export function ItemGrid() {
 
   useEffect(() => {
     fetchItems(selectedTag)
+
+    // Only poll when items are actively processing — saves unnecessary requests
+    const hasActiveItems = items.some(
+      (i) => i.status === 'pending' || i.status === 'processing'
+    )
+    if (!hasActiveItems && items.length > 0) return
+
     const interval = setInterval(() => fetchItems(selectedTag), 5000)
     return () => clearInterval(interval)
-  }, [fetchItems, selectedTag])
+  }, [fetchItems, selectedTag, items])
 
   const displayItems = searchResults ?? items
 
@@ -1984,9 +2162,8 @@ Add all variables from `.env.example`:
 - `YOUTUBE_API_KEY`
 - `ASSEMBLYAI_API_KEY`
 - `ASSEMBLYAI_WEBHOOK_SECRET` (generate a random string: `openssl rand -hex 32`)
-- `UPSTASH_REDIS_REST_URL`
-- `UPSTASH_REDIS_REST_TOKEN`
 - `NEXT_PUBLIC_APP_URL` (set to your Vercel deployment URL)
+- `API_SECRET_KEY` (generate a random string: `openssl rand -hex 32`)
 
 **Step 4: Deploy**
 
@@ -2006,9 +2183,161 @@ If any items are already in the DB, ensure `NEXT_PUBLIC_APP_URL` matches your Ve
 
 ---
 
+## Task 17: Retry Endpoint
+
+**Files:**
+- Create: `src/app/api/items/[id]/retry/route.ts`
+
+**Step 1: Create retry route**
+
+Create `src/app/api/items/[id]/retry/route.ts`:
+
+```typescript
+import { NextRequest, NextResponse } from 'next/server'
+import { after } from 'next/server'
+import { createAdminClient } from '@/lib/supabase/admin'
+import { requireAuth } from '@/lib/auth'
+import { logger } from '@/lib/logger'
+import { detectSourceType } from '@/lib/pipeline/detect'
+import { processArticle } from '@/lib/pipeline/article'
+import { processYouTube } from '@/lib/pipeline/youtube'
+import { submitPodcastForTranscription } from '@/lib/pipeline/podcast'
+
+const MAX_RETRIES = 3
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  const authError = requireAuth(request)
+  if (authError) return authError
+
+  const { id } = await params
+  const supabase = createAdminClient()
+
+  const { data: item } = await supabase
+    .from('items')
+    .select('id, source_url, source_type, status, retry_count')
+    .eq('id', id)
+    .single()
+
+  if (!item) {
+    return NextResponse.json({ error: 'Item not found' }, { status: 404 })
+  }
+
+  if (item.status !== 'failed') {
+    return NextResponse.json({ error: 'Only failed items can be retried' }, { status: 400 })
+  }
+
+  if (item.retry_count >= MAX_RETRIES) {
+    return NextResponse.json({ error: `Max retries (${MAX_RETRIES}) exceeded` }, { status: 400 })
+  }
+
+  await supabase.from('items').update({
+    status: 'pending',
+    error_message: null,
+    retry_count: item.retry_count + 1,
+  }).eq('id', id)
+
+  logger.info('Retry triggered', { itemId: id, attempt: item.retry_count + 1 })
+
+  after(async () => {
+    await supabase.from('items').update({ status: 'processing' }).eq('id', id)
+
+    try {
+      const sourceType = item.source_type as 'article' | 'youtube' | 'podcast'
+
+      if (sourceType === 'podcast') {
+        const { transcription_job_id, title, author } = await submitPodcastForTranscription(item.source_url)
+        await supabase.from('items').update({ transcription_job_id, title, author, status: 'processing' }).eq('id', id)
+      } else {
+        const data = sourceType === 'article'
+          ? await processArticle(item.source_url)
+          : await processYouTube(item.source_url)
+        await supabase.from('items').update({ ...data, status: 'ready' }).eq('id', id)
+      }
+
+      logger.info('Retry succeeded', { itemId: id })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      logger.error('Retry failed', { itemId: id, error: message })
+      await supabase.from('items').update({ status: 'failed', error_message: message }).eq('id', id)
+    }
+  })
+
+  return NextResponse.json({ ok: true, retry_count: item.retry_count + 1 })
+}
+```
+
+**Step 2: Commit**
+
+```bash
+git add src/app/api/items/[id]/retry/
+git commit -m "feat: add retry endpoint for failed items"
+```
+
+---
+
+## Task 18: Stuck Item Cron
+
+**Files:**
+- Create: `src/app/api/cron/unstick/route.ts`
+- Create: `vercel.json`
+
+**Step 1: Create cron handler**
+
+Create `src/app/api/cron/unstick/route.ts`:
+
+```typescript
+import { NextResponse } from 'next/server'
+import { createAdminClient } from '@/lib/supabase/admin'
+import { logger } from '@/lib/logger'
+
+export const dynamic = 'force-dynamic'
+
+export async function GET() {
+  const supabase = createAdminClient()
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString()
+
+  const { data: stuck } = await supabase
+    .from('items')
+    .select('id')
+    .in('status', ['pending', 'processing'])
+    .lt('updated_at', tenMinutesAgo)
+
+  if (stuck && stuck.length > 0) {
+    await supabase
+      .from('items')
+      .update({ status: 'failed', error_message: 'Processing timed out' })
+      .in('id', stuck.map((i) => i.id))
+
+    logger.warn('Unstuck stale items', { count: stuck.length, ids: stuck.map((i) => i.id) })
+  }
+
+  return NextResponse.json({ unstuck: stuck?.length ?? 0 })
+}
+```
+
+**Step 2: Create `vercel.json`**
+
+```json
+{
+  "crons": [{ "path": "/api/cron/unstick", "schedule": "*/10 * * * *" }]
+}
+```
+
+**Step 3: Commit**
+
+```bash
+git add src/app/api/cron/ vercel.json
+git commit -m "feat: add cron job to unstick stale processing items"
+```
+
+---
+
 ## Summary
 
-Total tasks: 16
+Total tasks: 18
 Key integration points to validate manually:
 - Supabase: run both migration files before testing API routes
 - AssemblyAI: test with a short podcast episode first to verify webhook roundtrip

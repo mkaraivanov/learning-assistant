@@ -2,7 +2,7 @@
 name: block-destructive-github
 enabled: true
 event: bash
-pattern: git push\s+.*(-f\b|--force(?!-with-lease))|git push\s+(-f\b|--force(?!-with-lease))|git reset\s+--hard|git branch\s+-D\s|gh\s+(pr\s+(close|merge)|issue\s+close|release\s+delete|repo\s+delete)
+pattern: ^(git push\s+.*(-f\b|--force(?!-with-lease))|git push\s+(-f\b|--force(?!-with-lease))|git reset\s+--hard|git branch\s+-D\s|gh\s+(pr\s+(close|merge)|issue\s+close|release\s+delete|repo\s+delete))
 action: block
 ---
 

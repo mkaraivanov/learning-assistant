@@ -79,7 +79,43 @@ See `.env.example`. Required for all features:
 
 ## Testing
 
-No automated tests yet. End-to-end test: start dev server (`npm run dev`), then run `/add-item <url>`.
+### Running Tests
+
+```bash
+npm run test:unit         # Vitest unit tests (~10s)
+npm run test:integration  # Vitest integration tests, requires local Supabase (~60s)
+npm run test:e2e          # Playwright e2e tests (~3min)
+npm test                  # unit + integration (CI default)
+npm run test:watch        # unit tests in watch mode
+npm run test:coverage     # unit tests with coverage report
+```
+
+### Prerequisites for integration and e2e
+
+- Supabase CLI installed and `supabase start` running
+- Both migrations applied: `supabase db push`
+- `.env.test.local` with test DB credentials (see `.env.example`)
+
+### Test layers
+
+| Layer | Location | Scope |
+|---|---|---|
+| Unit | `tests/unit/` | Pure functions — `src/lib/pipeline/**`, `src/lib/llm/**` |
+| Integration | `tests/integration/` | API route handlers, real local Supabase, MSW for external APIs |
+| E2E | `tests/e2e/` | Full browser flows via Playwright |
+
+### TDD workflow
+
+Write a failing test first. Watch it fail. Write minimal code to pass. Refactor. Repeat.
+No production code without a failing test first.
+
+### Coverage target
+
+80% on `src/lib/pipeline/**` and `src/lib/llm/**`.
+
+### Design doc
+
+`docs/plans/2026-03-16-testing-design.md`
 
 ## Code Style
 

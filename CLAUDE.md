@@ -20,19 +20,27 @@ src/
     api/
       items/route.ts                # POST (submit URL), GET (paginated list)
       items/[id]/route.ts           # GET (single), DELETE
+      items/[id]/retry/route.ts     # POST retry failed items
       search/route.ts               # GET ?q= semantic search via pgvector
       transcribe/callback/route.ts  # AssemblyAI webhook (podcasts)
+      cron/unstick/route.ts         # Cron: mark stale processing items as failed
   lib/
+    logger.ts                       # Structured JSON logger (stdout → Vercel logs)
+    env.ts                          # Validated env vars — fail fast on missing keys
+    auth.ts                         # API key auth guard (skipped in dev)
     supabase/
       client.ts                     # Browser client
       server.ts                     # Server client (uses cookies)
       admin.ts                      # Service role — server-only, never import in components
     llm/
       index.ts                      # getLLMProvider() + getEmbeddingProvider() factories
+      prompts.ts                    # Shared SUMMARIZE_PROMPT constant
+      parse-summary.ts              # Safe JSON parser with fence-stripping + validation
       claude.ts                     # ClaudeProvider implements LLMProvider
       openai.ts                     # OpenAILLMProvider + OpenAIEmbeddingProvider
     pipeline/
       detect.ts                     # Classify URL → 'article' | 'youtube' | 'podcast'
+      validate-url.ts               # SSRF protection — blocks private IPs, enforces http(s)
       article.ts                    # Readability extraction
       youtube.ts                    # YouTube Data API + youtube-transcript
       podcast.ts                    # AssemblyAI submit + process
@@ -43,7 +51,7 @@ src/
 
 ## Key Patterns
 
-**Processing flow**: POST /api/items creates item as `pending`, fires async processing, returns `{id}` immediately. Frontend polls GET /api/items/[id] every 3s until `ready` or `failed`.
+**Processing flow**: POST /api/items validates the URL (scheme, SSRF), checks for duplicates and rate limits, creates item as `pending`, uses `after()` to run processing reliably after the response, returns `{id}` immediately. Frontend polls GET /api/items/[id] every 3s until `ready` or `failed`. A Vercel cron marks items stuck in `processing` for >10min as `failed`.
 
 **Podcasts are different**: Submit to AssemblyAI → store `transcription_job_id` → wait for webhook at `/api/transcribe/callback`. Can take minutes.
 
@@ -68,14 +76,20 @@ See `.env.example`. Required for all features:
 - `YOUTUBE_API_KEY` — YouTube Data API v3 (must be enabled in Google Cloud Console)
 - `ASSEMBLYAI_API_KEY` + `ASSEMBLYAI_WEBHOOK_SECRET` — podcasts
 - `NEXT_PUBLIC_APP_URL` — full URL used as AssemblyAI webhook callback base
+- `API_SECRET_KEY` — required in production for API route authentication (skipped in dev)
+
+All required env vars are validated at startup via `src/lib/env.ts` — missing keys fail fast with a clear message.
 
 ## Gotchas
 
 - **ivfflat index requires data**: The vector index on `embedding` won't work well until ~100+ rows exist. Fine for dev.
-- **Vercel 60s limit**: Article/YouTube processing runs inline. Summarizing very long content with map-reduce can approach the limit. Keep an eye on function duration in Vercel logs.
+- **Vercel 60s limit**: Article/YouTube processing runs via `after()`. Summarizing very long content with map-reduce can approach the limit. Keep an eye on function duration in Vercel logs.
 - **AssemblyAI webhook in dev**: Use `ngrok` or Vercel preview URLs to test podcast webhooks locally.
 - **youtube-transcript**: Some videos have auto-captions disabled. The pipeline fails gracefully with a clear error message.
 - **Readability minimum**: Articles with < 200 chars of extracted text are rejected. JS-heavy or paywalled sites will fail.
+- **Duplicate URLs**: Submitting the same URL twice returns the existing item instead of creating a duplicate. The `source_url` column has a unique index.
+- **LLM JSON parsing**: LLMs occasionally return markdown fences or malformed JSON. The `parseSummaryResponse()` utility strips fences and validates the response shape before casting.
+- **Stuck items**: If a function crashes mid-processing, items can get stuck in `processing`. A Vercel cron at `/api/cron/unstick` runs every 10 minutes to mark stale items as `failed`. Users can retry from the UI.
 
 ## Testing
 

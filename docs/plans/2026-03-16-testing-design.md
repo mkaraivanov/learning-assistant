@@ -25,6 +25,7 @@ Establish a TDD-first testing strategy with unit, integration, and e2e layers be
 - **Runner:** Vitest (`vitest.config.ts`), `environment: 'node'`
 - **Scope:** Pure functions only — `src/lib/pipeline/**`, `src/lib/llm/**`
 - **No mocks needed** — these functions take inputs and return outputs
+- **Also covers:** `src/lib/llm/parse-summary.ts` (fence stripping, validation), `src/lib/pipeline/validate-url.ts` (SSRF blocking), `src/lib/env.ts` (missing var detection)
 - **Coverage target:** 80% on `src/lib/pipeline/**` and `src/lib/llm/**`
 
 ### Integration Tests (`tests/integration/`)
@@ -55,9 +56,13 @@ tests/
 │   │   ├── summarize.test.ts
 │   │   ├── article.test.ts
 │   │   └── youtube.test.ts
-│   └── llm/
-│       ├── claude.test.ts
-│       └── openai.test.ts
+│   ├── llm/
+│   │   ├── claude.test.ts
+│   │   ├── openai.test.ts
+│   │   └── parse-summary.test.ts
+│   └── lib/
+│       ├── validate-url.test.ts
+│       └── env.test.ts
 ├── integration/
 │   ├── msw/
 │   │   ├── handlers.ts              # MSW request handlers
@@ -67,6 +72,7 @@ tests/
 │   │   └── request.ts               # typed fetch wrappers for API routes
 │   ├── items.test.ts
 │   ├── items-id.test.ts
+│   ├── items-retry.test.ts
 │   ├── search.test.ts
 │   └── transcribe-callback.test.ts
 └── e2e/
@@ -139,6 +145,9 @@ jobs:
 - Next.js page components — covered by E2E
 - Podcast webhook in E2E — requires ngrok, tested at integration level only
 - RLS policies — out of scope (single-user, `user_id = null`)
+- `src/lib/auth.ts` — thin wrapper, tested implicitly via integration tests
+- `src/lib/logger.ts` — thin wrapper around `console.log/error`, no logic to test
+- Cron endpoint (`/api/cron/unstick`) — simple DB query, tested manually
 
 ---
 

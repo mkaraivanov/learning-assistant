@@ -10,6 +10,38 @@
 
 ---
 
+## Task 0: Testing Infrastructure
+
+> Set up before any production code. See `docs/plans/2026-03-16-testing-design.md` for full design.
+
+**Files to create:**
+- `vitest.config.ts` — unit test config (`tests/unit/**`, `environment: 'node'`)
+- `vitest.integration.config.ts` — integration config (`tests/integration/**`, `testTimeout: 15000`, `globalSetup` to verify Supabase)
+- `playwright.config.ts` — e2e config with `webServer` launching `npm run dev`
+- `tests/integration/msw/handlers.ts` — MSW handlers for OpenAI, Anthropic, AssemblyAI, YouTube
+- `tests/integration/msw/server.ts` — MSW Node server setup
+- `tests/integration/helpers/db.ts` — seed/reset helpers
+- `tests/integration/helpers/request.ts` — typed fetch wrappers
+- `.github/workflows/ci.yml` — unit → integration → e2e pipeline with `supabase/setup-cli`
+
+**Dev dependencies to install:**
+```bash
+npm install -D vitest @vitest/coverage-v8 msw @playwright/test
+npx playwright install --with-deps chromium
+```
+
+**npm scripts to add to `package.json`:**
+```json
+"test:unit":        "vitest run --config vitest.config.ts",
+"test:integration": "vitest run --config vitest.integration.config.ts",
+"test:e2e":         "playwright test",
+"test":             "npm run test:unit && npm run test:integration",
+"test:watch":       "vitest --config vitest.config.ts",
+"test:coverage":    "vitest run --coverage --config vitest.config.ts"
+```
+
+---
+
 ## Task 1: Initialize Next.js Project
 
 **Files:**

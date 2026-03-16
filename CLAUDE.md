@@ -10,7 +10,11 @@ npm run build     # verify before deploying
 
 ## Architecture
 
+> **Status (2026-03-16):** Project is in initial setup. No code exists yet — see `docs/plans/2026-03-16-learning-assistant.md` for the implementation plan.
+
 Next.js 14 App Router on Vercel. All processing happens in serverless API routes.
+
+**Key dependencies**: `@mozilla/readability` (article extraction), `youtube-transcript` (captions), `assemblyai` (podcast transcription), `@upstash/redis` (job state), `rss-parser` (podcast feeds)
 
 ```
 src/
@@ -76,13 +80,14 @@ See `.env.example`. Required for all features:
 - `YOUTUBE_API_KEY` — YouTube Data API v3 (must be enabled in Google Cloud Console)
 - `ASSEMBLYAI_API_KEY` + `ASSEMBLYAI_WEBHOOK_SECRET` — podcasts
 - `NEXT_PUBLIC_APP_URL` — full URL used as AssemblyAI webhook callback base
+- `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` — Upstash Redis for job state
 - `API_SECRET_KEY` — required in production for API route authentication (skipped in dev)
 
 All required env vars are validated at startup via `src/lib/env.ts` — missing keys fail fast with a clear message.
 
 ## Gotchas
 
-- **ivfflat index requires data**: The vector index on `embedding` won't work well until ~100+ rows exist. Fine for dev.
+- **Vector index**: Using HNSW (`vector_cosine_ops`) — works on any dataset size, no minimum row count required.
 - **Vercel 60s limit**: Article/YouTube processing runs via `after()`. Summarizing very long content with map-reduce can approach the limit. Keep an eye on function duration in Vercel logs.
 - **AssemblyAI webhook in dev**: Use `ngrok` or Vercel preview URLs to test podcast webhooks locally.
 - **youtube-transcript**: Some videos have auto-captions disabled. The pipeline fails gracefully with a clear error message.
@@ -145,3 +150,4 @@ No production code without a failing test first.
 - Use Plan Mode for any task touching 3+ files
 - Implementation plan: `docs/plans/2026-03-16-learning-assistant.md`
 - If Claude makes the same mistake twice, `/clear` and write a more specific prompt
+- Use context7 (MCP) to fetch up-to-date docs before introducing new libraries or APIs — avoids hallucinated method signatures

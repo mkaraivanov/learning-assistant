@@ -1,0 +1,33 @@
+{
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '$CLAUDE_TOOL_INPUT' | python3 -c \"\nimport sys, json\nd = json.load(sys.stdin)\nf = d.get('file_path', '')\nif '.env.local' in f:\n    print('BLOCKED: .env.local contains real secrets. Edit it manually in your terminal.')\n    exit(2)\n\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /Users/martin.karaivanov/Projects/Personal/learning-assistant-1 && [ -f node_modules/.bin/tsc ] && node_modules/.bin/tsc --noEmit 2>&1 | head -20 || true"
+          },
+          {
+            "type": "command",
+            "command": "cd /Users/martin.karaivanov/Projects/Personal/learning-assistant-1 && [ -f node_modules/.bin/next ] && node_modules/.bin/next lint --quiet 2>&1 | head -20 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

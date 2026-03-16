@@ -142,7 +142,7 @@ CREATE TABLE items (
 );
 
 -- Indexes
-CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX ON items USING gin (tags);
 CREATE INDEX ON items (status);
 CREATE INDEX ON items (created_at DESC);
